@@ -4641,26 +4641,45 @@ cvtScaleHalf_<short, float>( const short* src, size_t sstep, float* dst, size_t 
 }
 
 #ifdef HAVE_OPENVX
+
+#ifdef _DEBUG
+#define VX_DbgThrow(s) CV_Error(cv::Error::StsInternal, (s))
+#else
+#define VX_DbgThrow(s) return false;
+#endif
+
 template<typename T, typename DT>
 static bool _openvx_cvt(const T* src, size_t sstep,
-                        DT* dst, size_t dstep, Size size)
+                        DT* dst, size_t dstep, Size continuousSize)
 {
     using namespace ivx;
 
-    if(!(size.width > 0 && size.height > 0))
+    if(!(continuousSize.width > 0 && continuousSize.height > 0 && sstep > 0 && dstep > 0))
     {
         return true;
+    }
+
+    CV_Assert(sstep / sizeof(T) == dstep / sizeof(DT));
+
+    //.height is for number of continuous pieces
+    //.width  is for length of one piece
+    Size imgSize = continuousSize;
+    if(continuousSize.height == 1)
+    {
+        //continuous case
+        imgSize.width  = sstep / sizeof(T);
+        imgSize.height = continuousSize.width / (sstep / sizeof(T));
     }
 
     try
     {
         Context context = Context::create();
         Image srcImage = Image::createFromHandle(context, Image::matTypeToFormat(DataType<T>::type),
-                                                 Image::createAddressing(size.width, size.height,
+                                                 Image::createAddressing(imgSize.width, imgSize.height,
                                                                          (vx_uint32)sizeof(T), (vx_uint32)sstep),
                                                  (void*)src);
         Image dstImage = Image::createFromHandle(context, Image::matTypeToFormat(DataType<DT>::type),
-                                                 Image::createAddressing(size.width, size.height,
+                                                 Image::createAddressing(imgSize.width, imgSize.height,
                                                                          (vx_uint32)sizeof(DT), (vx_uint32)dstep),
                                                  (void*)dst);
 
@@ -4674,13 +4693,11 @@ static bool _openvx_cvt(const T* src, size_t sstep,
     }
     catch (RuntimeError & e)
     {
-        CV_Error(CV_StsInternal, e.what());
-        return false;
+        VX_DbgThrow(e.what());
     }
     catch (WrapperError & e)
     {
-        CV_Error(CV_StsInternal, e.what());
-        return false;
+        VX_DbgThrow(e.what());
     }
 
     return true;
@@ -5374,6 +5391,41 @@ static bool ocl_LUT(InputArray _src, InputArray _lut, OutputArray _dst)
 
 #endif
 
+#ifdef HAVE_OPENVX
+static bool openvx_LUT(Mat src, Mat dst, Mat _lut)
+{
+    if (src.type() != CV_8UC1 || dst.type() != src.type() || _lut.type() != src.type() || !_lut.isContinuous())
+        return false;
+
+    try
+    {
+        ivx::Context ctx = ivx::Context::create();
+
+        ivx::Image
+            ia = ivx::Image::createFromHandle(ctx, VX_DF_IMAGE_U8,
+                ivx::Image::createAddressing(src.cols, src.rows, 1, (vx_int32)(src.step)), src.data),
+            ib = ivx::Image::createFromHandle(ctx, VX_DF_IMAGE_U8,
+                ivx::Image::createAddressing(dst.cols, dst.rows, 1, (vx_int32)(dst.step)), dst.data);
+
+        ivx::LUT lut = ivx::LUT::create(ctx);
+        lut.copyFrom(_lut);
+        ivx::IVX_CHECK_STATUS(vxuTableLookup(ctx, ia, lut, ib));
+    }
+    catch (ivx::RuntimeError & e)
+    {
+        CV_Error(CV_StsInternal, e.what());
+        return false;
+    }
+    catch (ivx::WrapperError & e)
+    {
+        CV_Error(CV_StsInternal, e.what());
+        return false;
+    }
+
+    return true;
+}
+#endif
+
 #if defined(HAVE_IPP)
 namespace ipp {
 
@@ -5638,6 +5690,11 @@ void cv::LUT( InputArray _src, InputArray _lut, OutputArray _dst )
     Mat src = _src.getMat(), lut = _lut.getMat();
     _dst.create(src.dims, src.size, CV_MAKETYPE(_lut.depth(), cn));
     Mat dst = _dst.getMat();
+
+#ifdef HAVE_OPENVX
+    if (openvx_LUT(src, dst, lut))
+        return;
+#endif
 
     CV_IPP_RUN(_src.dims() <= 2, ipp_lut(src, lut, dst));
 
